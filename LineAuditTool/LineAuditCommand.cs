@@ -1,0 +1,729 @@
+﻿// BlockMatcher.cs  (C# 7.3 compatible)
+// Always runs Python exporter once per session (no emptiness checks).
+// Prefers Python-generated previews from INSTANCES and AUTO_CLUSTERS,
+// with tolerant matching + debug logs, and vector fallback.
+// Aligns replacements by a common pivot (center of extents) so they don't shift.
+// FIX: ListView thumbnails are letterboxed to a square (no stretching).
+
+using Autodesk.AutoCAD.ApplicationServices;
+using Autodesk.AutoCAD.DatabaseServices;
+using Autodesk.AutoCAD.EditorInput;
+using Autodesk.AutoCAD.Geometry;
+using Autodesk.AutoCAD.Colors;
+using Autodesk.AutoCAD.Runtime;
+
+using System.Collections.Generic;
+using System.Linq;
+using System.Drawing;
+using System.Windows.Forms;
+using System;
+
+using System.IO;           // file IO
+using System.Diagnostics;  // process
+
+using DFont = System.Drawing.Font;
+using DrawingColor = System.Drawing.Color;
+
+[assembly: CommandClass(typeof(LineAuditTool.BlockMatcher))]
+
+namespace LineAuditTool
+{
+    public class BlockMatcher
+    {
+        // ======== CONFIG: paths ========
+        private const string MasterDwgPath = @"C:\Users\admin\Downloads\VIZ-AUTOCAD\M1.dwg";
+
+        // Python export locations (root only; drawing folder is inferred)
+        private const string PythonExportsRoot = @"C:\Users\admin\Downloads\VIZ-AUTOCAD\EXPORTS";
+        private const string InstancesDirName = "INSTANCES";
+        private const string AutoClustersDirName = "AUTO_CLUSTERS";
+
+        // ALWAYS run the Python exporter exactly once per session (best-effort)
+        private const string PythonExe = "python";
+        private const string PythonExporterScript = @"C:\Users\admin\Downloads\VIZ-AUTOCAD\SCRIPTS\one.py";
+        private const int PythonTimeoutMs = 25000;            // 25s safety
+        private static bool _exporterRunThisSession = false;
+
+        // ======== PUBLIC COMMAND ========
+        [CommandMethod("MATCHANDREPLACECHAIRS")]
+        public void MatchAndReplaceChairsFromMaster()
+        {
+            Document doc = Autodesk.AutoCAD.ApplicationServices.Application.DocumentManager.MdiActiveDocument;
+            Editor ed = doc.Editor;
+            Database db = doc.Database;
+
+            // NEW: Always attempt to run the Python exporter ONCE per session
+            RunPythonExporterOnce(ed);
+
+            PromptSelectionResult selRes = ed.GetSelection(new PromptSelectionOptions
+            {
+                MessageForAdding = "\nSelect chair blocks to match and replace:"
+            }, new SelectionFilter(new[]
+            {
+                new TypedValue((int)DxfCode.Start, "INSERT")
+            }));
+
+            if (selRes.Status != PromptStatus.OK)
+            {
+                ed.WriteMessage("\n⛔ No blocks selected.");
+                return;
+            }
+
+            var blockRefsByName = new Dictionary<string, List<ObjectId>>();
+            using (Transaction tr = db.TransactionManager.StartTransaction())
+            {
+                foreach (SelectedObject sel in selRes.Value)
+                {
+                    if (sel == null) continue;
+                    var br = tr.GetObject(sel.ObjectId, OpenMode.ForRead) as BlockReference;
+                    var btr = tr.GetObject(br.BlockTableRecord, OpenMode.ForRead) as BlockTableRecord;
+                    string name = btr.Name;
+
+                    if (!blockRefsByName.ContainsKey(name))
+                        blockRefsByName[name] = new List<ObjectId>();
+                    blockRefsByName[name].Add(sel.ObjectId);
+                }
+                tr.Commit();
+            }
+
+            Dictionary<string, ObjectId> masterBlocks = new Dictionary<string, ObjectId>();
+            using (Database masterDb = new Database(false, true))
+            {
+                masterDb.ReadDwgFile(MasterDwgPath, FileOpenMode.OpenForReadAndAllShare, true, "");
+
+                using (Transaction mtr = masterDb.TransactionManager.StartTransaction())
+                {
+                    BlockTable mbt = (BlockTable)mtr.GetObject(masterDb.BlockTableId, OpenMode.ForRead);
+                    foreach (ObjectId id in mbt)
+                    {
+                        var btr = mtr.GetObject(id, OpenMode.ForRead) as BlockTableRecord;
+                        if (!btr.IsAnonymous && !btr.IsLayout)
+                        {
+                            masterBlocks[btr.Name] = id;
+                        }
+                    }
+                    mtr.Commit();
+                }
+
+                foreach (var kvp in blockRefsByName)
+                {
+                    string selectedBlock = kvp.Key;
+
+                    var suggestions = masterBlocks.Keys
+                        .Select(name => (name, ComputeNameSimilarity(selectedBlock, name)))
+                        .OrderByDescending(x => x.Item2)
+                        .Take(5)
+                        .ToList();
+
+                    string chosenMasterName = ShowPreviewSelectionForm(selectedBlock, suggestions.Select(s => s.name).ToList(), masterDb, ed);
+
+                    if (string.IsNullOrEmpty(chosenMasterName))
+                    {
+                        ed.WriteMessage($"\n⏭️ Skipping '{selectedBlock}'...");
+                        continue;
+                    }
+
+                    ed.WriteMessage($"\n✅ Replacing '{selectedBlock}' with '{chosenMasterName}'...");
+
+                    string masterRefLayer = "0";
+                    Autodesk.AutoCAD.Colors.Color masterLayerColor = Autodesk.AutoCAD.Colors.Color.FromColorIndex(ColorMethod.ByAci, 7);
+
+                    using (Transaction mtr2 = masterDb.TransactionManager.StartTransaction())
+                    {
+                        BlockTable mbt = (BlockTable)mtr2.GetObject(masterDb.BlockTableId, OpenMode.ForRead);
+                        BlockTableRecord ms = (BlockTableRecord)mtr2.GetObject(mbt[BlockTableRecord.ModelSpace], OpenMode.ForRead);
+
+                        foreach (ObjectId entId in ms)
+                        {
+                            var br = mtr2.GetObject(entId, OpenMode.ForRead) as BlockReference;
+                            if (br != null)
+                            {
+                                var brDef = (BlockTableRecord)mtr2.GetObject(br.BlockTableRecord, OpenMode.ForRead);
+                                if (brDef.Name == chosenMasterName)
+                                {
+                                    masterRefLayer = br.Layer;
+
+                                    LayerTable lt = (LayerTable)mtr2.GetObject(masterDb.LayerTableId, OpenMode.ForRead);
+                                    if (lt.Has(masterRefLayer))
+                                    {
+                                        LayerTableRecord ltr = (LayerTableRecord)mtr2.GetObject(lt[masterRefLayer], OpenMode.ForRead);
+                                        masterLayerColor = ltr.Color;
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        mtr2.Commit();
+                    }
+
+                    using (Transaction tr2 = db.TransactionManager.StartTransaction())
+                    {
+                        LayerTable lt = (LayerTable)tr2.GetObject(db.LayerTableId, OpenMode.ForRead);
+                        if (!lt.Has(masterRefLayer))
+                        {
+                            lt.UpgradeOpen();
+                            LayerTableRecord newLayer = new LayerTableRecord
+                            {
+                                Name = masterRefLayer,
+                                Color = masterLayerColor
+                            };
+                            lt.Add(newLayer);
+                            tr2.AddNewlyCreatedDBObject(newLayer, true);
+                        }
+                        else
+                        {
+                            LayerTableRecord existing = (LayerTableRecord)tr2.GetObject(lt[masterRefLayer], OpenMode.ForWrite);
+                            existing.Color = masterLayerColor;
+                        }
+                        tr2.Commit();
+                    }
+
+                    IdMapping idMap = new IdMapping();
+                    masterDb.WblockCloneObjects(
+                        new ObjectIdCollection(new[] { masterBlocks[chosenMasterName] }),
+                        db.BlockTableId,
+                        idMap,
+                        DuplicateRecordCloning.Replace,
+                        false
+                    );
+
+                    using (Transaction tr = db.TransactionManager.StartTransaction())
+                    {
+                        BlockTable bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+                        BlockTableRecord ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
+
+                        foreach (ObjectId id in kvp.Value)
+                        {
+                            var oldBr = tr.GetObject(id, OpenMode.ForWrite) as BlockReference;
+
+                            // Capture old transform
+                            Point3d oldPos = oldBr.Position;
+                            double oldRot = oldBr.Rotation;
+                            Scale3d oldScale = oldBr.ScaleFactors;
+
+                            // Definitions
+                            BlockTableRecord oldDef = (BlockTableRecord)tr.GetObject(oldBr.BlockTableRecord, OpenMode.ForRead);
+                            BlockTableRecord newDef = (BlockTableRecord)tr.GetObject(bt[chosenMasterName], OpenMode.ForRead);
+
+                            // Choose pivot (center of geometric extents in block space)
+                            Point3d oldLocalPivot = GetBlockPivot(oldDef, tr);
+                            Point3d newLocalPivot = GetBlockPivot(newDef, tr);
+
+                            // Old pivot in WORLD
+                            Matrix3d oldXform = oldBr.BlockTransform;
+                            Point3d oldPivotWorld = oldLocalPivot.TransformBy(oldXform);
+
+                            // Remove old
+                            oldBr.Erase();
+
+                            // Insert new at same insert/rot/scale
+                            BlockReference newBr = new BlockReference(oldPos, bt[chosenMasterName])
+                            {
+                                Rotation = oldRot,
+                                ScaleFactors = oldScale,
+                                Layer = masterRefLayer
+                            };
+                            ms.AppendEntity(newBr);
+                            tr.AddNewlyCreatedDBObject(newBr, true);
+
+                            // Compute new pivot in WORLD and displace so pivots match
+                            Matrix3d newXform = newBr.BlockTransform;
+                            Point3d newPivotWorld = newLocalPivot.TransformBy(newXform);
+                            Vector3d delta = oldPivotWorld - newPivotWorld;
+                            if (!delta.IsZeroLength())
+                            {
+                                newBr.TransformBy(Matrix3d.Displacement(delta));
+                            }
+                        }
+                        tr.Commit();
+                    }
+                }
+            }
+        }
+
+        // ======== name similarity ========
+        private int ComputeNameSimilarity(string a, string b)
+        {
+            a = a.ToLower(); b = b.ToLower();
+            int score = 0;
+            if (a == b) score += 100;
+            if (a.Contains(b) || b.Contains(a)) score += 50;
+            score += a.Intersect(b).Count();
+            return score;
+        }
+
+        // ======== vector preview renderer (fallback) ========
+        private Bitmap GenerateBlockPreview(Database db, string blockName)
+        {
+            // Draw at 128x128, then run through PreparePreviewBitmap anyway for consistency
+            Bitmap bmp = new Bitmap(128, 128);
+            using (Graphics g = Graphics.FromImage(bmp))
+            {
+                g.Clear(DrawingColor.White);
+                g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+                g.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.HighQuality;
+                g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+
+                using (Transaction tr = db.TransactionManager.StartTransaction())
+                {
+                    BlockTable bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+                    if (!bt.Has(blockName)) return PreparePreviewBitmap(bmp, 128, 8);
+
+                    BlockTableRecord btr = (BlockTableRecord)tr.GetObject(bt[blockName], OpenMode.ForRead);
+
+                    // First pass: compute extents
+                    Extents3d? extOpt = null;
+                    foreach (ObjectId id in btr)
+                    {
+                        Entity ent = tr.GetObject(id, OpenMode.ForRead) as Entity;
+                        if (ent != null)
+                        {
+                            try
+                            {
+                                var entExt = ent.GeometricExtents;
+                                extOpt = extOpt == null ? entExt : UnionExtents(extOpt.Value, entExt);
+                            }
+                            catch { }
+                        }
+                    }
+
+                    if (extOpt == null) return PreparePreviewBitmap(bmp, 128, 8);
+                    Extents3d ext = extOpt.Value;
+
+                    // Use a slightly tighter frame than 108 to reduce inner margins
+                    double target = 116.0; // tweak if you want more/less breathing room
+                    double width = ext.MaxPoint.X - ext.MinPoint.X;
+                    double height = ext.MaxPoint.Y - ext.MinPoint.Y;
+                    if (width <= 1e-9 || height <= 1e-9) return PreparePreviewBitmap(bmp, 128, 8);
+
+                    double scale = Math.Min(target / width, target / height);
+                    double offsetX = (bmp.Width - width * scale) / 2.0;
+                    double offsetY = (bmp.Height - height * scale) / 2.0;
+
+                    // Second pass: draw entities
+                    foreach (ObjectId id in btr)
+                    {
+                        Entity ent = tr.GetObject(id, OpenMode.ForRead) as Entity;
+                        if (ent == null) continue;
+
+                        Polyline pl = ent as Polyline;
+                        if (pl != null)
+                        {
+                            for (int i = 0; i < pl.NumberOfVertices - 1; i++)
+                            {
+                                Point2d p1 = pl.GetPoint2dAt(i);
+                                Point2d p2 = pl.GetPoint2dAt(i + 1);
+                                double bulge = pl.GetBulgeAt(i);
+
+                                if (bulge != 0)
+                                    DrawArcSegment(g, p1, p2, bulge, ext, scale, offsetX, offsetY, bmp.Height);
+                                else
+                                    DrawLineSegment(g, p1.X, p1.Y, p2.X, p2.Y, ext, scale, offsetX, offsetY, bmp.Height);
+                            }
+                            continue;
+                        }
+
+                        Line ln = ent as Line;
+                        if (ln != null)
+                        {
+                            DrawLineSegment(g, ln.StartPoint.X, ln.StartPoint.Y, ln.EndPoint.X, ln.EndPoint.Y, ext, scale, offsetX, offsetY, bmp.Height);
+                            continue;
+                        }
+
+                        Arc arc = ent as Arc;
+                        if (arc != null)
+                        {
+                            RectangleF arcRect = ToScreenRectangle(arc.Center, arc.Radius, ext, scale, offsetX, offsetY, bmp.Height);
+                            float startAngle = (float)RadiansToDegrees(arc.StartAngle);
+                            float sweepAngle = (float)RadiansToDegrees(arc.EndAngle - arc.StartAngle);
+                            g.DrawArc(Pens.Black, arcRect, startAngle, sweepAngle);
+                            continue;
+                        }
+
+                        Circle circ = ent as Circle;
+                        if (circ != null)
+                        {
+                            RectangleF circRect = ToScreenRectangle(circ.Center, circ.Radius, ext, scale, offsetX, offsetY, bmp.Height);
+                            g.DrawEllipse(Pens.Black, circRect);
+                            continue;
+                        }
+
+                        Ellipse ellipse = ent as Ellipse;
+                        if (ellipse != null)
+                        {
+                            RectangleF rect = ToScreenRectangle(ellipse.Center, ellipse.MajorRadius, ext, scale, offsetX, offsetY, bmp.Height);
+                            g.DrawEllipse(Pens.Black, rect);
+                            continue;
+                        }
+
+                        Spline spline = ent as Spline;
+                        if (spline != null)
+                        {
+                            double startParam = spline.StartParam;
+                            double endParam = spline.EndParam;
+                            int sampleCount = 30;
+
+                            List<PointF> screenPoints = new List<PointF>();
+                            for (int i = 0; i <= sampleCount; i++)
+                            {
+                                double param = startParam + (endParam - startParam) * i / sampleCount;
+                                Point3d p = spline.GetPointAtParameter(param);
+                                PointF screen = new PointF(
+                                    (float)((p.X - ext.MinPoint.X) * scale + offsetX),
+                                    (float)(bmp.Height - ((p.Y - ext.MinPoint.Y) * scale + offsetY))
+                                );
+                                screenPoints.Add(screen);
+                            }
+
+                            if (screenPoints.Count >= 2)
+                                g.DrawLines(Pens.Black, screenPoints.ToArray());
+                        }
+                    }
+
+                    tr.Commit();
+                }
+            }
+
+            // Safety: ensure consistent framing even if size changes later
+            return PreparePreviewBitmap(bmp, 128, 8);
+        }
+
+        private void DrawLineSegment(Graphics g, double x1, double y1, double x2, double y2,
+            Extents3d ext, double scale, double offsetX, double offsetY, int canvasHeight)
+        {
+            g.DrawLine(Pens.Black,
+                (float)((x1 - ext.MinPoint.X) * scale + offsetX),
+                (float)(canvasHeight - ((y1 - ext.MinPoint.Y) * scale + offsetY)),
+                (float)((x2 - ext.MinPoint.X) * scale + offsetX),
+                (float)(canvasHeight - ((y2 - ext.MinPoint.Y) * scale + offsetY)));
+        }
+
+        private void DrawArcSegment(Graphics g, Point2d p1, Point2d p2, double bulge,
+            Extents3d ext, double scale, double offsetX, double offsetY, int canvasHeight)
+        {
+            double bulgeAbs = System.Math.Abs(bulge);
+            double includedAngle = 4 * System.Math.Atan(bulgeAbs);
+            double chord = p1.GetDistanceTo(p2);
+            double radius = chord / (2 * System.Math.Sin(includedAngle / 2));
+
+            // Find arc center
+            Vector2d dir = (p2 - p1).GetNormal();
+            Vector2d normal = new Vector2d(-dir.Y, dir.X); // Perpendicular to chord
+
+            double height = radius * System.Math.Cos(includedAngle / 2);
+            Point2d midpoint = new Point2d((p1.X + p2.X) / 2, (p1.Y + p2.Y) / 2);
+            Point2d center = midpoint + normal * (bulge > 0 ? height : -height);
+
+            // Compute angles
+            double startAngle = System.Math.Atan2(p1.Y - center.Y, p1.X - center.X);
+            double endAngle = System.Math.Atan2(p2.Y - center.Y, p2.X - center.X);
+            double sweepAngle = RadiansToDegrees(endAngle - startAngle);
+            if (sweepAngle < 0) sweepAngle += 360;
+
+            RectangleF rect = ToScreenRectangle(new Point3d(center.X, center.Y, 0), radius, ext, scale, offsetX, offsetY, canvasHeight);
+            using (var path = new System.Drawing.Drawing2D.GraphicsPath())
+            {
+                path.AddArc(rect, (float)RadiansToDegrees(startAngle), (float)sweepAngle);
+                g.DrawPath(Pens.Black, path);
+            }
+        }
+
+        private PointF TransformPoint(Point2d pt, Extents3d ext, double scale, double offsetX, double offsetY, int canvasHeight)
+        {
+            return new PointF(
+                (float)((pt.X - ext.MinPoint.X) * scale + offsetX),
+                (float)(canvasHeight - ((pt.Y - ext.MinPoint.Y) * scale + offsetY)));
+        }
+
+        private double RadiansToDegrees(double radians)
+        {
+            return radians * (180.0 / System.Math.PI);
+        }
+
+        private RectangleF ToScreenRectangle(Point3d center, double radius, Extents3d ext, double scale, double offsetX, double offsetY, int canvasHeight)
+        {
+            float cx = (float)((center.X - ext.MinPoint.X) * scale + offsetX);
+            float cy = (float)(canvasHeight - ((center.Y - ext.MinPoint.Y) * scale + offsetY));
+            float r = (float)(radius * scale);
+            return new RectangleF(cx - r, cy - r, r * 2, r * 2);
+        }
+
+        private Extents3d UnionExtents(Extents3d a, Extents3d b)
+        {
+            Point3d min = new Point3d(Math.Min(a.MinPoint.X, b.MinPoint.X), Math.Min(a.MinPoint.Y, b.MinPoint.Y), 0);
+            Point3d max = new Point3d(Math.Max(a.MaxPoint.X, b.MaxPoint.X), Math.Max(a.MaxPoint.Y, b.MaxPoint.Y), 0);
+            return new Extents3d(min, max);
+        }
+
+        // ======== PIVOT HELPER (center of extents in block space) ========
+        // If you want to align by base point instead, just return Point3d.Origin here.
+        private static Point3d GetBlockPivot(BlockTableRecord btr, Transaction tr)
+        {
+            Extents3d? extOpt = null;
+            foreach (ObjectId id in btr)
+            {
+                var ent = tr.GetObject(id, OpenMode.ForRead) as Entity;
+                if (ent == null) continue;
+                try
+                {
+                    var e = ent.GeometricExtents;
+                    extOpt = extOpt == null
+                        ? (Extents3d?)e
+                        : new Extents3d(
+                            new Point3d(Math.Min(extOpt.Value.MinPoint.X, e.MinPoint.X),
+                                        Math.Min(extOpt.Value.MinPoint.Y, e.MinPoint.Y), 0),
+                            new Point3d(Math.Max(extOpt.Value.MaxPoint.X, e.MaxPoint.X),
+                                        Math.Max(extOpt.Value.MaxPoint.Y, e.MaxPoint.Y), 0));
+                }
+                catch { /* some entities may not have extents */ }
+            }
+
+            if (extOpt.HasValue)
+            {
+                var ex = extOpt.Value;
+                return new Point3d(
+                    (ex.MinPoint.X + ex.MaxPoint.X) * 0.5,
+                    (ex.MinPoint.Y + ex.MaxPoint.Y) * 0.5,
+                    0.0);
+            }
+            return Point3d.Origin; // fallback
+        }
+
+        // ======== Python preview integration ========
+
+        // Auto-derive drawing folder (e.g., "...\\M1.dwg" -> "M1")
+        private static string DrawingFolderFromMaster
+        {
+            get
+            {
+                try { return Path.GetFileNameWithoutExtension(MasterDwgPath); }
+                catch { return "M1"; }
+            }
+        }
+
+        private static string InstancesDirFullPath(string root)
+        {
+            return Path.Combine(root, DrawingFolderFromMaster, InstancesDirName);
+        }
+
+        private static string AutoClustersDirFullPath(string root)
+        {
+            return Path.Combine(root, DrawingFolderFromMaster, AutoClustersDirName);
+        }
+
+        // Mirror Python's make_safe
+        private static string MakeSafe(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name)) return "Unnamed";
+            foreach (var c in "<>:\"/\\|?*".ToCharArray())
+                name = name.Replace(c, '_');
+            return name.Trim();
+        }
+
+        // Case-insensitive Contains for file names
+        private static bool ContainsCI(string haystack, string needle)
+        {
+            return haystack != null && needle != null &&
+                   haystack.IndexOf(needle, StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        // Normalize similar to Python's make_safe + lowercasing
+        private static string NormalizeToken(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            foreach (var c in "<>:\"/\\|?*".ToCharArray()) s = s.Replace(c, '_');
+            return s.Replace(' ', '_').ToLowerInvariant();
+        }
+
+        // Return all files in a dir that match any of the patterns (non-recursive)
+        private static IEnumerable<string> GetFilesMultiPattern(string dir, params string[] patterns)
+        {
+            if (!Directory.Exists(dir)) yield break;
+            for (int i = 0; i < patterns.Length; i++)
+            {
+                string pat = patterns[i];
+                string[] arr = new string[0];
+                try { arr = Directory.GetFiles(dir, pat, SearchOption.TopDirectoryOnly); }
+                catch { }
+                for (int j = 0; j < arr.Length; j++)
+                    yield return arr[j];
+            }
+        }
+
+        // Return a preview path for this block from INSTANCES or AUTO_CLUSTERS (robust matching)
+        private static string FindPythonPreviewPath(string blockName, Editor ed = null)
+        {
+            try
+            {
+                var safe = MakeSafe(blockName);
+                var key = NormalizeToken(safe);
+
+                string instDir = InstancesDirFullPath(PythonExportsRoot);
+                string cluDir = AutoClustersDirFullPath(PythonExportsRoot);
+
+                if (ed != null)
+                    ed.WriteMessage("\n[Preview] Key='" + key + "'  INST='" + instDir + "'  CLU='" + cluDir + "'");
+
+                // 1) INSTANCES exact prefix "<Block>__###.jpg"
+                var instExact = GetFilesMultiPattern(instDir, safe + "__*.jpg").FirstOrDefault();
+                if (!string.IsNullOrEmpty(instExact)) return instExact;
+
+                // INSTANCES relaxed contains
+                var instLoose = GetFilesMultiPattern(instDir, "*.jpg")
+                                .FirstOrDefault(p => ContainsCI(Path.GetFileNameWithoutExtension(p), key));
+                if (!string.IsNullOrEmpty(instLoose)) return instLoose;
+
+                // 2) AUTO_CLUSTERS: "<Block>__cluster*.jpg"
+                var cluExact = GetFilesMultiPattern(cluDir, safe + "__cluster*.jpg").FirstOrDefault();
+                if (!string.IsNullOrEmpty(cluExact)) return cluExact;
+
+                // AUTO_CLUSTERS relaxed contains
+                var cluLoose1 = GetFilesMultiPattern(cluDir, "*.jpg")
+                                .FirstOrDefault(p => ContainsCI(Path.GetFileNameWithoutExtension(p), key));
+                if (!string.IsNullOrEmpty(cluLoose1)) return cluLoose1;
+
+                // ultra-relaxed: remove underscores for fuzzy match
+                var keyNoUnderscore = key.Replace("_", "");
+                var cluLoose2 = GetFilesMultiPattern(cluDir, "*.jpg")
+                                .FirstOrDefault(p =>
+                                {
+                                    var name = NormalizeToken(Path.GetFileNameWithoutExtension(p)).Replace("_", "");
+                                    return name.Contains(keyNoUnderscore);
+                                });
+                if (!string.IsNullOrEmpty(cluLoose2)) return cluLoose2;
+            }
+            catch { }
+
+            return null;
+        }
+
+        // ======== Thumbnail prep (LETTERBOX, no stretching) ========
+        private static Bitmap PreparePreviewBitmap(Bitmap src, int box = 128, int margin = 8)
+        {
+            var dst = new Bitmap(box, box);
+            using (var g = Graphics.FromImage(dst))
+            {
+                g.Clear(DrawingColor.White);
+                g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+                g.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.HighQuality;
+                g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+
+                double maxW = box - 2 * margin;
+                double maxH = box - 2 * margin;
+                double scale = Math.Min(maxW / src.Width, maxH / src.Height);
+
+                int w = Math.Max(1, (int)Math.Round(src.Width * scale));
+                int h = Math.Max(1, (int)Math.Round(src.Height * scale));
+                int x = (box - w) / 2;
+                int y = (box - h) / 2;
+
+                g.DrawImage(src, new Rectangle(x, y, w, h));
+            }
+            return dst;
+        }
+
+        // Load bitmap from file and clone it so ImageList doesn't lock the file,
+        // then letterbox to a square thumbnail to avoid distortion.
+        private static Bitmap LoadBitmapClone(string path)
+        {
+            using (var tmp = new Bitmap(path))
+            {
+                using (var clone = new Bitmap(tmp))
+                    return PreparePreviewBitmap(clone, 128, 8);
+            }
+        }
+
+        // NEW: Always run the Python exporter once per session (no emptiness checks)
+        private static void RunPythonExporterOnce(Editor ed = null)
+        {
+            if (_exporterRunThisSession) return;
+            _exporterRunThisSession = true;
+
+            try
+            {
+                var psi = new ProcessStartInfo();
+                psi.FileName = PythonExe;
+                psi.Arguments = "\"" + PythonExporterScript + "\"";
+                psi.UseShellExecute = false;
+                psi.RedirectStandardOutput = true;
+                psi.RedirectStandardError = true;
+                psi.CreateNoWindow = true;
+                psi.WorkingDirectory = Path.GetDirectoryName(PythonExporterScript);
+
+                var p = Process.Start(psi);
+                if (p != null)
+                {
+                    if (!p.WaitForExit(PythonTimeoutMs))
+                    {
+                        try { p.Kill(); } catch { }
+                    }
+                    p.Dispose();
+                }
+
+                if (ed != null) ed.WriteMessage("\n(i) Python preview export attempted (run-once).");
+            }
+            catch (System.Exception ex)
+            {
+                if (ed != null) ed.WriteMessage("\n(!) Python export failed: " + ex.Message);
+                // Non-fatal...
+            }
+        }
+
+        // ======== Picker UI (uses Python previews first; logs what it picks) ========
+        private string ShowPreviewSelectionForm(string selectedBlock, List<string> suggestions, Database masterDb, Editor ed)
+        {
+            // Also attempt exporter here (no-op if already run)
+            RunPythonExporterOnce(ed);
+
+            Form form = new Form { Text = "Suggestions for " + selectedBlock, Width = 540, Height = 420 };
+            ListView listView = new ListView { Dock = DockStyle.Fill, View = View.LargeIcon, MultiSelect = false };
+            ImageList imageList = new ImageList { ImageSize = new Size(128, 128), ColorDepth = ColorDepth.Depth32Bit };
+            listView.LargeImageList = imageList;
+
+            using (Transaction tr = masterDb.TransactionManager.StartTransaction())
+            {
+                BlockTable bt = (BlockTable)tr.GetObject(masterDb.BlockTableId, OpenMode.ForRead);
+
+                foreach (var name in suggestions)
+                {
+                    if (!bt.Has(name)) continue;
+
+                    if (ed != null) ed.WriteMessage("\n[Preview] Trying: " + name);
+
+                    // Prefer Python-generated file
+                    string chosenPath = FindPythonPreviewPath(name, ed);
+                    Bitmap bmp = null;
+
+                    if (!string.IsNullOrEmpty(chosenPath) && File.Exists(chosenPath))
+                    {
+                        if (ed != null) ed.WriteMessage("  -> from file: " + chosenPath);
+                        bmp = LoadBitmapClone(chosenPath); // already letterboxed
+                    }
+                    else
+                    {
+                        if (ed != null) ed.WriteMessage("  -> no file, using vector preview.");
+                        bmp = GenerateBlockPreview(masterDb, name); // returns letterboxed
+                    }
+
+                    imageList.Images.Add(name, bmp);
+                    listView.Items.Add(new ListViewItem(name, name));
+                }
+                tr.Commit();
+            }
+
+            form.Controls.Add(listView);
+            string selected = null;
+            Button ok = new Button { Text = "OK", Dock = DockStyle.Bottom };
+            ok.Click += (s, e) =>
+            {
+                if (listView.SelectedItems.Count > 0)
+                    selected = listView.SelectedItems[0].Text;
+                form.Close();
+            };
+            form.Controls.Add(ok);
+            form.ShowDialog();
+
+            return selected;
+        }
+    }
+}
