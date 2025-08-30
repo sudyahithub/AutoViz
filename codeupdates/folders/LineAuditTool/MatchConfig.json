@@ -1,0 +1,13 @@
+{
+  "Weights": {
+    "Hash": 0.7,
+    "Geometry": 0.3
+  },
+  "HashBlend": {
+    "P": 0.6,
+    "D": 0.4
+  },
+  "MaxCandidates": 50,
+  "AmbiguityMargin": 0.08,
+  "MinScore": 0.65
+}

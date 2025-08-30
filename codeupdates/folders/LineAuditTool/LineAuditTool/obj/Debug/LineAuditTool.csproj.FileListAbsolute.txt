@@ -1,0 +1,4 @@
+C:\Users\admin\source\repos\LineAuditTool\LineAuditTool\obj\Debug\LineAuditTool.csproj.AssemblyReference.cache
+C:\Users\admin\source\repos\LineAuditTool\LineAuditTool\obj\Debug\LineAuditTool.Properties.Resources.resources
+C:\Users\admin\source\repos\LineAuditTool\LineAuditTool\obj\Debug\LineAuditTool.csproj.GenerateResource.cache
+C:\Users\admin\source\repos\LineAuditTool\LineAuditTool\obj\Debug\LineAuditTool.csproj.CoreCompileInputs.cache
