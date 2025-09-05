@@ -1,0 +1,57 @@
+/** Google Apps Script: Web App for BOQ uploads.
+ * Deploy: Deploy > Manage deployments > New deployment > "Web app"
+ * - Execute as: Me
+ * - Who has access: Anyone
+ * Copy the Web app URL and put it in your Python flag --gs-webapp
+ */
+
+function doPost(e) {
+  try {
+    var body = e.postData && e.postData.contents ? e.postData.contents : "{}";
+    var p = JSON.parse(body);
+
+    var ss = SpreadsheetApp.openById(p.sheetId);
+    var tab = String(p.tab || 'Detail');
+    var mode = String(p.mode || 'replace').toLowerCase(); // 'replace' or 'append'
+    var headers = p.headers || [];
+    var rows = p.rows || [];
+
+    var sh = ss.getSheetByName(tab) || ss.insertSheet(tab);
+
+    if (mode === 'replace') {
+      sh.clearContents();
+      if (headers && headers.length) {
+        sh.getRange(1, 1, 1, headers.length).setValues([headers]);
+        sh.setFrozenRows(1);
+      }
+      if (rows && rows.length) {
+        sh.getRange(sh.getLastRow()+1, 1, rows.length, rows[0].length).setValues(rows);
+      }
+    } else { // append
+      if (sh.getLastRow() === 0 && headers && headers.length) {
+        sh.getRange(1, 1, 1, headers.length).setValues([headers]);
+        sh.setFrozenRows(1);
+      }
+      if (rows && rows.length) {
+        sh.getRange(sh.getLastRow()+1, 1, rows.length, rows[0].length).setValues(rows);
+      }
+    }
+
+    // Optional summary sheet
+    if (p.summaryTab && p.summaryRows && p.summaryRows.length) {
+      var sname = String(p.summaryTab);
+      var ssh = ss.getSheetByName(sname) || ss.insertSheet(sname);
+      ssh.clearContents();
+      ssh.getRange(1, 1, p.summaryRows.length, p.summaryRows[0].length).setValues(p.summaryRows);
+      ssh.setFrozenRows(1);
+    }
+
+    return ContentService
+      .createTextOutput(JSON.stringify({ ok: true, wrote: rows.length }))
+      .setMimeType(ContentService.MimeType.JSON);
+  } catch (err) {
+    return ContentService
+      .createTextOutput(JSON.stringify({ ok:false, error: String(err) }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+}
