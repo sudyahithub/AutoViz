@@ -1,6 +1,9 @@
 // File: LineAuditCommand.cs
-// Command: POLY2TRI_VALIDATE
-// Finds poly2tri/CDT-breaking issues directly in AutoCAD.
+// Commands:
+//   POLY2TRI_VALIDATE     → find & mark issues
+//   POLY2TRI_CLEAR_ERRORS → delete all markers/labels on _TRI_ERRORS
+//
+// Finds CDT-breaking issues directly in AutoCAD.
 // Handles LWPOLYLINE/2D/3D (open/closed), CIRCLE, ARC, SPLINE (tessellated).
 // Drops red circles + DBText labels on layer _TRI_ERRORS.
 
@@ -22,13 +25,23 @@ namespace LineAuditTool
     {
         // ======== CONFIG ========
         private const string ErrorLayer = "_TRI_ERRORS";
+
+        // Geometry tolerances
         private const double Eps = 1e-6;
         private const double NearDupEps = 1e-4;
         private const double CollinearDeg = 0.5;
-        private const double MarkerRadius = 20;
+
+        // Marker/label sizing (reduced)
+        private const double MarkerRadius = 6.0;   // was 20
+        private const double TextHeight = 2.2;   // fixed height (was 0.4 * radius ≈ 8)
+        private const double LabelOffset = 8.0;   // XY offset from marker center
+
+        // Tessellation
         private const int CircleSides = 64;
         private const int ArcSides = 32;
         private const int SplineSamples = 64;
+
+        // Optional CDT probe (compile-time guarded)
         private const bool USE_POLY2TRI = false;
         // =========================
 
@@ -52,6 +65,7 @@ namespace LineAuditTool
             public int GetHashCode(Issue x) => x.Message.GetHashCode();
         }
 
+        // -------------------- MAIN: VALIDATE --------------------
         [CommandMethod("POLY2TRI_VALIDATE")]
         public void ValidatePolylines()
         {
@@ -146,11 +160,64 @@ namespace LineAuditTool
                 }
 
                 ed.WriteMessage($"\nChecked {totalLoops} loop(s). Marked {totalIssues} issue(s) on layer {ErrorLayer}.");
-                ed.WriteMessage("\nTip: isolate layer _TRI_ERRORS, fix points, then ERASE markers.");
+                ed.WriteMessage("\nTip: isolate layer _TRI_ERRORS, fix points, then run POLY2TRI_CLEAR_ERRORS to clean markers.");
             }
             catch (System.Exception ex)
             {
                 ed.WriteMessage($"\n[POLY2TRI_VALIDATE] Error: {ex.Message}");
+            }
+        }
+
+        // -------------------- CLEAN: CLEAR ERRORS --------------------
+        [CommandMethod("POLY2TRI_CLEAR_ERRORS")]
+        public void ClearErrorMarkersCmd()
+        {
+            var doc = Application.DocumentManager.MdiActiveDocument;
+            var db = doc.Database;
+            var ed = doc.Editor;
+
+            try
+            {
+                int deleted = 0;
+                using (var tr = db.TransactionManager.StartTransaction())
+                {
+                    var lt = (LayerTable)tr.GetObject(db.LayerTableId, OpenMode.ForRead);
+                    if (!lt.Has(ErrorLayer))
+                    {
+                        ed.WriteMessage($"\nNothing to clear: layer {ErrorLayer} does not exist.");
+                        tr.Commit();
+                        return;
+                    }
+
+                    var bt = (BlockTable)tr.GetObject(db.BlockTableId, OpenMode.ForRead);
+                    var ms = (BlockTableRecord)tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
+
+                    var toErase = new List<Entity>();
+                    foreach (ObjectId id in ms)
+                    {
+                        var ent = tr.GetObject(id, OpenMode.ForRead) as Entity;
+                        if (ent == null) continue;
+                        if (ent.Layer.Equals(ErrorLayer, StringComparison.OrdinalIgnoreCase))
+                        {
+                            ent.UpgradeOpen();
+                            toErase.Add(ent);
+                        }
+                    }
+
+                    foreach (var ent in toErase)
+                    {
+                        ent.Erase();
+                        deleted++;
+                    }
+
+                    tr.Commit();
+                }
+
+                ed.WriteMessage($"\nPOLY2TRI_CLEAR_ERRORS: deleted {deleted} object(s) on {ErrorLayer}.");
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[POLY2TRI_CLEAR_ERRORS] Error: {ex.Message}");
             }
         }
 
@@ -221,7 +288,7 @@ namespace LineAuditTool
             else if (ent is Spline sp)
             {
                 var pts = new List<Point2d>();
-                double t0 = sp.StartParam, t1 = sp.EndParam;   // <-- fixed
+                double t0 = sp.StartParam, t1 = sp.EndParam;
                 for (int i = 0; i <= SplineSamples; i++)
                 {
                     double t = t0 + (t1 - t0) * i / SplineSamples;
@@ -410,8 +477,8 @@ namespace LineAuditTool
                     t.Layer = ErrorLayer;
                     t.Color = Color.FromRgb(255, 64, 64);
                     t.TextString = label;
-                    t.Height = MarkerRadius * 0.4;
-                    t.Position = new Point3d(pos.X + MarkerRadius * 2, pos.Y + MarkerRadius * 2, 0);
+                    t.Height = TextHeight;
+                    t.Position = new Point3d(pos.X + LabelOffset, pos.Y + LabelOffset, 0);
                     ms.AppendEntity(t);
                     tr.AddNewlyCreatedDBObject(t, true);
                 }
