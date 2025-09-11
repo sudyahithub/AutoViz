@@ -1,7 +1,21 @@
-/** Google Apps Script: Web App for BOQ uploads + image previews.
- * Deploy: Deploy > Manage deployments > New deployment > "Web app"
- * - Execute as: Me
- * - Who has access: Anyone
+/** Web App: BOQ uploads + preview images (Drive URLs or direct embed)
+ * Payload JSON (POST):
+ * {
+ *   sheetId: string,
+ *   tab: string,                 // e.g. "Sheet9"
+ *   mode: "replace"|"append",    // default: "replace"
+ *   headers: string[],           // header row (sent on replace)
+ *   rows: any[][],               // data rows
+ *   images: string[],            // base64 PNG per row; "" for no image
+ *   vAlign: ""|"middle",         // optional vertical alignment
+ *   sparseAnchor: "first"|"last"|"middle", // label placement in merged Category col
+ *   runId: string,               // used for file naming
+ *   driveFolderId: string,       // optional; else auto "DXF-Previews"
+ *   embedImages: boolean,        // OPTIONAL: true = insert PNG objects; false = =IMAGE(url)
+ *   imageMode: 1|2|3|4,          // OPTIONAL for =IMAGE; default 1
+ *   imageW: number,              // OPTIONAL for mode=3|4; default 28
+ *   imageH: number               // OPTIONAL for mode=3|4; default 28
+ * }
  */
 
 function doPost(e) {
@@ -9,85 +23,127 @@ function doPost(e) {
     var body = e.postData && e.postData.contents ? e.postData.contents : "{}";
     var p = JSON.parse(body);
 
-    var ss   = SpreadsheetApp.openById(p.sheetId);
-    var tab  = String(p.tab || 'Detail');
-    var mode = String(p.mode || 'replace').toLowerCase(); // 'replace'|'append'
-    var sh   = ss.getSheetByName(tab) || ss.insertSheet(tab);
+    var ss  = SpreadsheetApp.openById(p.sheetId);
+    var tab = String(p.tab || "Detail");
+    var sh  = ss.getSheetByName(tab) || ss.insertSheet(tab);
 
+    var mode   = String(p.mode || "replace").toLowerCase();
     var headers = Array.isArray(p.headers) ? p.headers : [];
     var rows    = Array.isArray(p.rows)    ? p.rows    : [];
-    var images  = Array.isArray(p.images)  ? p.images  : []; // base64 PNGs aligned to rows
-    var vAlign  = String(p.vAlign || "");           // "middle" or ""
-    var sparse  = String(p.sparseAnchor || "last"); // "first"|"last"|"middle"
+    var images  = Array.isArray(p.images)  ? p.images  : [];
+    var vAlign  = String(p.vAlign || "");
+    var sparse  = String(p.sparseAnchor || "last");
     var runId   = String(p.runId || "run");
-    var driveFolderId = String(p.driveFolderId || ""); // optional
+    var folderId = String(p.driveFolderId || "");
+    var embed   = !!p.embedImages;
 
-    if (mode === 'replace') {
+    // Optional =IMAGE controls (used only when embedImages === false)
+    var IMG_MODE = Number(p.imageMode || 1);  // 1=fit, 2=stretch, 3=custom, 4=original size (custom dims allowed)
+    var IMG_W    = Number(p.imageW || 28);
+    var IMG_H    = Number(p.imageH || 28);
+
+    if (mode === "replace") {
       sh.clearContents();
-      if (headers.length) {
-        sh.getRange(1,1,1,headers.length).setValues([headers]);
-      }
+      if (headers.length) sh.getRange(1, 1, 1, headers.length).setValues([headers]);
     }
-    // Append rows
+
+    // Write rows
     var startRow = sh.getLastRow() + 1;
     if (rows.length) {
       sh.getRange(startRow, 1, rows.length, rows[0].length).setValues(rows);
     }
 
-    // ----- Display polish + category merges -----
+    // Sheet polish & category merges (Category column = E = 5)
     var hasHeader = (sh.getLastRow() > 0 && headers.length > 0);
     var firstDataRow = hasHeader ? 2 : 1;
     var lastRow = sh.getLastRow();
     if (lastRow >= firstDataRow) {
       var rngAll = sh.getRange(firstDataRow, 1, lastRow - firstDataRow + 1, sh.getLastColumn());
-      rngAll.setHorizontalAlignment('center');
-      if (vAlign === 'middle') rngAll.setVerticalAlignment('middle');
-
-      // Merge contiguous identical values in Category column (E = 5)
-      mergeContiguousColumn_(sh, 5, firstDataRow, lastRow, sparse);
+      rngAll.setHorizontalAlignment("center");
+      if (vAlign === "middle") rngAll.setVerticalAlignment("middle");
+      mergeContiguousColumn_(sh, 5, firstDataRow, lastRow, sparse); // Category
     }
 
-    // ----- Preview images -----
-    // Find the "Preview" column index from headers (fallback to 11)
-    var previewCol = 11;
-    if (headers && headers.length) {
-      var idx = headers.indexOf("Preview");
-      if (idx >= 0) previewCol = idx + 1;
-    }
+    // ---------- Preview images ----------
+    // Determine the Preview column robustly.
+    var previewCol = detectPreviewColumn_(sh, headers);
 
     if (rows.length && previewCol) {
-      var folder = getOrCreateFolder_(driveFolderId);
+      var folder = getOrCreateFolder_(folderId);
+
       for (var i = 0; i < rows.length; i++) {
         var b64 = images[i] || "";
         if (!b64) continue;
 
-        // Create file in Drive
         var fileName = (runId + "_" + (startRow + i)).replace(/[^\w\-\.]/g, "_") + ".png";
         var blob = Utilities.newBlob(Utilities.base64Decode(b64), "image/png", fileName);
+
+        if (embed) {
+          // Directly embed PNG into the sheet (no URL & sharing needed)
+          var img = sh.insertImage(blob, previewCol, startRow + i);
+          img.setAltTextDescription(fileName);
+          // Optionally resize to IMG_W x IMG_H (px)
+          try { img.setWidth(IMG_W).setHeight(IMG_H); } catch (e2) {}
+          continue;
+        }
+
+        // Otherwise upload to Drive and insert =IMAGE(url)
         var file = folder.createFile(blob);
-        // Shareable for IMAGE() formula
         try {
+          // Broadest sharing first, then domain fallback
           file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
-        } catch (err) {
-          // ignore if restricted domain; IMAGE will still show for permitted viewers
+        } catch (err1) {
+          try {
+            file.setSharing(DriveApp.Access.DOMAIN_WITH_LINK, DriveApp.Permission.VIEW);
+          } catch (err2) {
+            // If both fail, the URL may not be publicly fetchable by IMAGE()
+            // Consider using embedImages:true in payload for a guaranteed inline image.
+          }
         }
         var fileId = file.getId();
-        var publicUrl = 'https://drive.google.com/uc?export=view&id=' + fileId;
+        var publicUrl = "https://drive.google.com/uc?export=view&id=" + fileId;
 
         var cell = sh.getRange(startRow + i, previewCol);
-        cell.setFormula('=IMAGE("' + publicUrl + '")');
-        cell.setHorizontalAlignment('center').setVerticalAlignment('middle');
+        // =IMAGE(url[, mode, height, width]) — we prefer mode with dimensions
+        if (IMG_MODE === 3 || IMG_MODE === 4) {
+          cell.setFormula('=IMAGE("' + publicUrl + '",' + IMG_MODE + ',' + IMG_H + ',' + IMG_W + ')');
+        } else {
+          cell.setFormula('=IMAGE("' + publicUrl + '",' + IMG_MODE + ')');
+        }
+        cell.setHorizontalAlignment("center").setVerticalAlignment("middle");
       }
     }
 
     return ContentService
-      .createTextOutput(JSON.stringify({ok:true}))
+      .createTextOutput(JSON.stringify({ ok: true }))
       .setMimeType(ContentService.MimeType.JSON);
+
   } catch (err) {
     return ContentService
-      .createTextOutput(JSON.stringify({ok:false, error:String(err)}))
+      .createTextOutput(JSON.stringify({ ok: false, error: String(err) }))
       .setMimeType(ContentService.MimeType.JSON);
   }
+}
+
+/** Detect the "Preview" column:
+ * 1) If headers are provided in payload, use them.
+ * 2) Else read the first row of the live sheet.
+ * 3) Fallback to column 13 (your current header order).
+ */
+function detectPreviewColumn_(sh, headersFromPayload) {
+  var DEFAULT_PREVIEW_COL = 13;
+
+  if (headersFromPayload && headersFromPayload.length) {
+    var idx = headersFromPayload.indexOf("Preview");
+    if (idx >= 0) return idx + 1;
+  }
+  if (sh.getLastRow() >= 1) {
+    var hdr = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0]
+      .map(function (h) { return String(h).trim(); });
+    var i2 = hdr.indexOf("Preview");
+    if (i2 >= 0) return i2 + 1;
+  }
+  return DEFAULT_PREVIEW_COL;
 }
 
 /** Merge contiguous identical cells in a given column.
@@ -99,7 +155,9 @@ function doPost(e) {
  */
 function mergeContiguousColumn_(sh, colIndex, r1, rN, anchor) {
   if (rN < r1) return;
-  var values = sh.getRange(r1, colIndex, rN - r1 + 1, 1).getValues().map(function(r){ return sanitize_(r[0]); });
+  var values = sh.getRange(r1, colIndex, rN - r1 + 1, 1)
+    .getValues()
+    .map(function (r) { return sanitize_(r[0]); });
 
   var runStart = 0; // index within values
   while (runStart < values.length) {
@@ -113,20 +171,18 @@ function mergeContiguousColumn_(sh, colIndex, r1, rN, anchor) {
       var a = r1 + runStart;
       var b = r1 + runEnd - 1;
       // set just one anchor label
-      if (anchor === 'first') {
-        sh.getRange(a, colIndex, len, 1).clearContent();
+      sh.getRange(a, colIndex, len, 1).clearContent();
+      if (anchor === "first") {
         sh.getRange(a, colIndex).setValue(v);
-      } else if (anchor === 'middle') {
+      } else if (anchor === "middle") {
         var mid = Math.floor((a + b) / 2);
-        sh.getRange(a, colIndex, len, 1).clearContent();
         sh.getRange(mid, colIndex).setValue(v);
-      } else { // 'last' default
-        sh.getRange(a, colIndex, len, 1).clearContent();
+      } else { // 'last'
         sh.getRange(b, colIndex).setValue(v);
       }
       // merge & center
       sh.getRange(a, colIndex, len, 1).merge();
-      sh.getRange(a, colIndex).setHorizontalAlignment('center').setVerticalAlignment('middle');
+      sh.getRange(a, colIndex).setHorizontalAlignment("center").setVerticalAlignment("middle");
     }
     runStart = runEnd;
   }
@@ -134,8 +190,8 @@ function mergeContiguousColumn_(sh, colIndex, r1, rN, anchor) {
 
 function sanitize_(s) {
   if (s == null) return "";
-  s = String(s).replace(/\u00A0/g, ' '); // NBSP → space
-  s = s.replace(/\s+/g, ' ').trim();
+  s = String(s).replace(/\u00A0/g, " "); // NBSP → space
+  s = s.replace(/\s+/g, " ").trim();
   return s.toUpperCase(); // case-insensitive grouping
 }
 
