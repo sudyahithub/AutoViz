@@ -33,7 +33,7 @@ OUT_ROOT   = r"C:\Users\admin\Downloads\VIZ-AUTOCAD\EXPORTS"
 # ===========================================
 
 # ===== GOOGLE WEB APP DEFAULTS (can be overridden via CLI) =====
-GS_WEBAPP_URL       = "https://script.google.com/macros/s/AKfycbz8imGgNtDdQks_v9xjJjZ2F4YgNkjUaawgHAYZRRceEjZKL3N11UsPb5_cbr7Q30iY/exec"
+GS_WEBAPP_URL       = "https://script.google.com/macros/s/AKfycbxRLD_OgZc6i5lEv7SQIyOUtJih411rkpccKJoaI2vzp5DzMjeiGl4J-RJjCfcA_fKp/exec"
 GSHEET_ID           = "1TbmU6vYevnhhYGFP-j91g752iFj_O0nkofAZn86akU0"
 GSHEET_TAB          = "Sheet9"
 GSHEET_SUMMARY_TAB  = ""          # leave blank → auto "<GSHEET_TAB>_ByLayer"
